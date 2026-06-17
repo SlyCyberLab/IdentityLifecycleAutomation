@@ -25,8 +25,8 @@
 # Configuration
 # -------------------------------------------------------
 $TenantId       = "6f5c979b-2a52-4309-bcb8-02e039c8fcc6"
-$ClientId       = ""  # App registration client ID
-$LicenseSkuId   = ""  # M365 Business Premium SKU ID
+$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"  # App registration client ID
+$LicenseSkuId   = "00e1ec7b-e4a3-40d1-9441-b69b597ab222"  # M365 Business Premium SKU ID
 $Domain         = "slytech.us"
 $ListName       = "NewHireRequests"
 $LogPath        = "C:\Logs\HireAutomation\onboarding.log"

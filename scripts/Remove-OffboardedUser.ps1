@@ -25,7 +25,7 @@
 # Configuration
 # -------------------------------------------------------
 $TenantId       = "6f5c979b-2a52-4309-bcb8-02e039c8fcc6"
-$ClientId       = ""  # App registration client ID
+$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"  # App registration client ID
 $Domain         = "slytech.us"
 $ListName       = "OffboardingRequests"
 $DisabledOU     = "OU=Disabled,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
