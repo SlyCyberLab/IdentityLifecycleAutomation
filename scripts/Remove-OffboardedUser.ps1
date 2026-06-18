@@ -18,14 +18,14 @@
     - Microsoft.Graph PowerShell module
     - Microsoft.PowerShell.SecretManagement module
     - Microsoft.PowerShell.SecretStore module
-    - SharePoint list with offboarding request schema
+    - SharePoint list: OffboardingRequests
 #>
 
 # -------------------------------------------------------
 # Configuration
 # -------------------------------------------------------
 $TenantId       = "6f5c979b-2a52-4309-bcb8-02e039c8fcc6"
-$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"  # App registration client ID
+$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"
 $Domain         = "slytech.us"
 $ListName       = "OffboardingRequests"
 $DisabledOU     = "OU=Disabled,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
@@ -56,7 +56,6 @@ function Test-OffboardingRequest {
     param($Fields)
 
     $errors = @()
-
     $requiredFields = @("UPN", "ManagerEmail", "LastWorkingDay")
 
     foreach ($field in $requiredFields) {
@@ -87,16 +86,14 @@ function Test-OffboardingRequest {
 }
 
 # -------------------------------------------------------
-# Connect to Microsoft Graph
+# Connect to Microsoft Graph using client secret (no WAM)
 # -------------------------------------------------------
 function Connect-Graph {
     Write-Log "Connecting to Microsoft Graph..."
     $clientSecret = Get-GraphSecret
-    Connect-MgGraph `
-        -TenantId     $TenantId `
-        -ClientId     $ClientId `
-        -ClientSecret $clientSecret `
-        -NoWelcome
+    $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+    $credential   = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+    Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -NoWelcome -ErrorAction Stop
     Write-Log "Connected to Microsoft Graph."
 }
 
@@ -113,11 +110,9 @@ function Disable-HireADUser {
         throw "AD user not found for UPN: $UPN"
     }
 
-    # Disable the account
     Disable-ADAccount -Identity $adUser.SamAccountName
     Write-Log "AD account disabled: $UPN"
 
-    # Remove from all groups except Domain Users (primary group, cannot be removed)
     foreach ($groupDN in $adUser.MemberOf) {
         try {
             Remove-ADGroupMember -Identity $groupDN -Members $adUser.SamAccountName -Confirm:$false
@@ -127,11 +122,9 @@ function Disable-HireADUser {
         }
     }
 
-    # Move to Disabled OU
     Move-ADObject -Identity $adUser.DistinguishedName -TargetPath $DisabledOU
     Write-Log "Moved $UPN to Disabled OU: $DisabledOU"
 
-    # Append OFFBOARDED to description for audit trail
     Set-ADUser -Identity $adUser.SamAccountName `
         -Description "OFFBOARDED: $(Get-Date -Format 'yyyy-MM-dd') - Account disabled by Identity Lifecycle Automation"
 
@@ -153,7 +146,7 @@ function Revoke-EntraSessions {
         return
     }
 
-    Revoke-MgUserSignInSession -UserId $UPN
+    Revoke-MgUserSignInSession -UserId $UPN | Out-Null
     Write-Log "All Entra ID sessions revoked for: $UPN"
 }
 
@@ -172,17 +165,19 @@ function Remove-UserLicense {
         return
     }
 
-    if ($user.AssignedLicenses.Count -eq 0) {
+    $assigned = @($user.AssignedLicenses)
+    if ($assigned.Count -eq 0) {
         Write-Log "No licenses assigned to $UPN. Nothing to remove."
         return
     }
 
-    $licenseSkuIds = $user.AssignedLicenses | Select-Object -ExpandProperty SkuId
+    $licenseSkuIds = @($assigned | Select-Object -ExpandProperty SkuId)
 
     Set-MgUserLicense `
         -UserId         $UPN `
         -AddLicenses    @() `
-        -RemoveLicenses $licenseSkuIds
+        -RemoveLicenses $licenseSkuIds `
+        -ErrorAction Stop | Out-Null
 
     Write-Log "Removed $($licenseSkuIds.Count) license(s) from $UPN"
 }
@@ -193,7 +188,7 @@ function Remove-UserLicense {
 function Invoke-EntraSync {
     Write-Log "Triggering Entra Connect delta sync..."
     Import-Module ADSync -ErrorAction SilentlyContinue
-    Start-ADSyncSyncCycle -PolicyType Delta
+    Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
     Write-Log "Delta sync triggered."
 }
 
@@ -201,7 +196,12 @@ function Invoke-EntraSync {
 # Send offboarding confirmation to manager
 # -------------------------------------------------------
 function Send-OffboardingConfirmation {
-    param($ManagerEmail, $DisplayName, $UPN, $LastWorkingDay)
+    param(
+        [string]$ManagerEmail,
+        [string]$DisplayName,
+        [string]$UPN,
+        [string]$LastWorkingDay
+    )
 
     $subject = "Offboarding Complete: $DisplayName"
     $body    = @"
@@ -209,10 +209,10 @@ Hello,
 
 The offboarding process for the following employee has been completed.
 
-Employee:        $DisplayName
-Username:        $UPN
+Employee:         $DisplayName
+Username:         $UPN
 Last Working Day: $LastWorkingDay
-Offboarded On:   $(Get-Date -Format 'yyyy-MM-dd HH:mm')
+Offboarded On:    $(Get-Date -Format 'yyyy-MM-dd HH:mm')
 
 Actions completed:
 - AD account disabled
@@ -235,21 +235,31 @@ This message was generated automatically by the SlyTech Identity Lifecycle Autom
         }
     }
 
-    Send-MgUserMail -UserId "admin@slytechlab.onmicrosoft.com" -BodyParameter $message
+    Send-MgUserMail -UserId "admin@slytechlab.onmicrosoft.com" -BodyParameter $message | Out-Null
     Write-Log "Offboarding confirmation sent to $ManagerEmail for $UPN"
 }
 
 # -------------------------------------------------------
-# Update SharePoint item status
+# Update SharePoint item status via raw Graph API
 # -------------------------------------------------------
 function Update-RequestStatus {
-    param($SiteId, $ListId, $ItemId, $Status)
+    param(
+        [string]$SiteId,
+        [string]$ListId,
+        [string]$ItemId,
+        [string]$Status
+    )
 
     $fields = @{
         Status        = $Status
         CompletedDate = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
     }
-    Update-MgSiteListItem -SiteId $SiteId -ListId $ListId -ListItemId $ItemId -Fields $fields
+
+    Invoke-MgGraphRequest -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$SiteId/lists/$ListId/items/$ItemId/fields" `
+        -Body ($fields | ConvertTo-Json) `
+        -ContentType "application/json" | Out-Null
+
     Write-Log "SharePoint item $ItemId updated to status: $Status"
 }
 
@@ -265,10 +275,13 @@ Write-Log "Script started on $env:COMPUTERNAME"
 try {
     Connect-Graph
 
-    $siteId  = (Get-MgSite -SiteId "slytechlab.sharepoint.com:/sites/IT").Id
-    $list    = Get-MgSiteList -SiteId $siteId | Where-Object { $_.DisplayName -eq $ListName }
-    $pending = Get-MgSiteListItem -SiteId $siteId -ListId $list.Id -ExpandProperty Fields |
-               Where-Object { $_.Fields.AdditionalData.Status -eq "Pending" }
+    $siteId = (Get-MgSite -SiteId "slytechlab.sharepoint.com:/sites/IT").Id
+    $list   = Get-MgSiteList -SiteId $siteId | Where-Object { $_.DisplayName -eq $ListName }
+
+    $result  = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$($list.Id)/items?expand=fields"
+    # Force array so .Count reflects record count, not property count on a single object
+    $pending = @($result.value | Where-Object { $_.fields.Status -eq "Pending" })
 
     if ($pending.Count -eq 0) {
         Write-Log "No pending offboarding requests found. Exiting."
@@ -279,17 +292,20 @@ try {
     Write-Log "Found $($pending.Count) pending offboarding request(s)"
 
     foreach ($item in $pending) {
-        $fields = $item.Fields.AdditionalData
+        $fields = $item.fields
 
-        Write-Log "--- Processing offboarding request ID: $($item.Id) ---"
+        Write-Log "--- Processing offboarding request ID: $($item.id) ---"
 
         try {
             Test-OffboardingRequest -Fields $fields
 
-            $upn            = $fields.UPN
-            $managerEmail   = $fields.ManagerEmail
-            $lastWorkingDay = $fields.LastWorkingDay
-            $displayName    = $fields.DisplayName
+            $upn            = [string]$fields.UPN
+            $managerEmail   = [string]$fields.ManagerEmail
+            $lastWorkingDay = [string]$fields.LastWorkingDay
+            $displayName    = [string]$fields.DisplayName
+            if ([string]::IsNullOrWhiteSpace($displayName)) {
+                $displayName = $upn.Split("@")[0]
+            }
 
             # Step 1: Disable AD account, remove groups, move to Disabled OU
             Disable-HireADUser -UPN $upn
@@ -314,17 +330,17 @@ try {
             Update-RequestStatus `
                 -SiteId  $siteId `
                 -ListId  $list.Id `
-                -ItemId  $item.Id `
+                -ItemId  $item.id `
                 -Status  "Completed"
 
             Write-Log "Successfully offboarded: $upn" "SUCCESS"
         }
         catch {
-            Write-Log "Failed to process offboarding request $($item.Id): $_" "ERROR"
+            Write-Log "Failed to process offboarding request $($item.id): $_" "ERROR"
             Update-RequestStatus `
                 -SiteId  $siteId `
                 -ListId  $list.Id `
-                -ItemId  $item.Id `
+                -ItemId  $item.id `
                 -Status  "Failed"
         }
     }

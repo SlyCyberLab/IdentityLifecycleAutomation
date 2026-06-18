@@ -17,7 +17,7 @@
     - Microsoft.Graph PowerShell module
     - Microsoft.PowerShell.SecretManagement module
     - Microsoft.PowerShell.SecretStore module
-    - SharePoint list with new hire request schema
+    - SharePoint list: NewHireRequests
     - M365 Business Premium license available in tenant
 #>
 
@@ -25,8 +25,8 @@
 # Configuration
 # -------------------------------------------------------
 $TenantId       = "6f5c979b-2a52-4309-bcb8-02e039c8fcc6"
-$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"  # App registration client ID
-$LicenseSkuId   = "00e1ec7b-e4a3-40d1-9441-b69b597ab222"  # M365 Business Premium SKU ID
+$ClientId       = "a86a6e33-b4bb-4781-bab9-b81d9807959e"
+$LicenseSkuId   = "00e1ec7b-e4a3-40d1-9441-b69b597ab222"
 $Domain         = "slytech.us"
 $ListName       = "NewHireRequests"
 $LogPath        = "C:\Logs\HireAutomation\onboarding.log"
@@ -34,23 +34,24 @@ $TranscriptPath = "C:\Logs\HireAutomation\Transcript-$((Get-Date).ToString('yyyy
 
 # -------------------------------------------------------
 # Department to OU and Group mapping
+# Uses actual AD groups from slytech.us domain
 # -------------------------------------------------------
 $DepartmentMap = @{
     "IT" = @{
         OU     = "OU=IT,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
-        Groups = @("IT-Staff", "File-IT")
+        Groups = @("IT-Users", "FileShare-IT-RW")
     }
     "Sales" = @{
         OU     = "OU=Sales,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
-        Groups = @("Sales-Staff", "File-Sales")
+        Groups = @("Sales-Users", "FileShare-Sales-RW")
     }
     "Security" = @{
         OU     = "OU=IT,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
-        Groups = @("IT-Staff", "Security-Staff")
+        Groups = @("IT-Users", "IT-Admins")
     }
     "HR" = @{
         OU     = "OU=Sales,OU=Users,OU=SLYTECH,DC=slytech,DC=us"
-        Groups = @("Sales-Staff")
+        Groups = @("Sales-Users", "HR")
     }
 }
 
@@ -76,7 +77,7 @@ function Get-GraphSecret {
 # -------------------------------------------------------
 function New-TempPassword {
     $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%'
-    return (-join (1..16 | ForEach-Object {
+    return [string](-join (1..16 | ForEach-Object {
         $chars[(Get-Random -Maximum $chars.Length)]
     }))
 }
@@ -93,13 +94,12 @@ function Test-Department {
 }
 
 # -------------------------------------------------------
-# Request validation - collects all errors before throwing
+# Request validation
 # -------------------------------------------------------
 function Test-NewHireRequest {
     param($Fields)
 
     $errors = @()
-
     $requiredFields = @("FirstName", "LastName", "Department", "JobTitle", "ManagerEmail")
 
     foreach ($field in $requiredFields) {
@@ -124,16 +124,12 @@ function Test-NewHireRequest {
     }
 
     if ($Fields.Department -and -not [string]::IsNullOrWhiteSpace($Fields.Department)) {
-        try {
-            Test-Department $Fields.Department
-        } catch {
-            $errors += $_.Exception.Message
-        }
+        try { Test-Department $Fields.Department }
+        catch { $errors += $_.Exception.Message }
     }
 
     if ($errors.Count -gt 0) {
-        $summary = $errors -join "; "
-        throw "Validation failed: $summary"
+        throw "Validation failed: $($errors -join '; ')"
     }
 }
 
@@ -146,7 +142,7 @@ function Test-LicenseAvailability {
     $sku = Get-MgSubscribedSku | Where-Object { $_.SkuId -eq $SkuId }
 
     if (-not $sku) {
-        throw "License SKU '$SkuId' not found in tenant. Run Get-MgSubscribedSku to list available SKUs."
+        throw "License SKU '$SkuId' not found in tenant."
     }
 
     $available = $sku.PrepaidUnits.Enabled - $sku.ConsumedUnits
@@ -159,56 +155,80 @@ function Test-LicenseAvailability {
 }
 
 # -------------------------------------------------------
-# Connect to Microsoft Graph
+# Connect to Microsoft Graph using client secret (no WAM)
 # -------------------------------------------------------
 function Connect-Graph {
     Write-Log "Connecting to Microsoft Graph..."
     $clientSecret = Get-GraphSecret
-    Connect-MgGraph `
-        -TenantId     $TenantId `
-        -ClientId     $ClientId `
-        -ClientSecret $clientSecret `
-        -NoWelcome
+    $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+    $credential   = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+    Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -NoWelcome -ErrorAction Stop
     Write-Log "Connected to Microsoft Graph."
 }
 
 # -------------------------------------------------------
-# Unique username generation
+# Generate unique SamAccountName
+# Returns guaranteed [string] - never an array
 # -------------------------------------------------------
 function Get-UniqueSamAccountName {
-    param([string]$FirstName, [string]$LastName)
+    param(
+        [string]$FirstName,
+        [string]$LastName
+    )
 
-    $base    = "$($FirstName.Substring(0,1).ToLower())$($LastName.ToLower())"
+    $base    = [string]("$($FirstName.Substring(0,1))$LastName").ToLower() -replace '\s', ''
     $sam     = $base
     $counter = 1
 
-    while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
+    while ($true) {
+        $existing = Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue
+        if (-not $existing) { break }
         Write-Log "Username '$sam' already exists, trying '$base$counter'" "WARN"
-        $sam = "$base$counter"
+        $sam = [string]"$base$counter"
         $counter++
     }
 
-    return $sam
+    return [string]$sam
 }
 
 # -------------------------------------------------------
 # Create AD user
+# Skips creation if user already exists in AD
+# Uses $script:ProvisionedUPN to avoid return value type issues
 # -------------------------------------------------------
 function New-HireADUser {
-    param($FirstName, $LastName, $Department, $JobTitle, $TempPassword)
+    param(
+        [string]$FirstName,
+        [string]$LastName,
+        [string]$Department,
+        [string]$JobTitle,
+        [string]$TempPassword
+    )
 
-    $username    = Get-UniqueSamAccountName -FirstName $FirstName -LastName $LastName
-    $displayName = "$FirstName $LastName"
-    $upn         = "$username@$Domain"
-    $mapping     = $DepartmentMap[$Department]
+    $script:ProvisionedUPN = $null
+    $displayName           = "$FirstName $LastName"
+    $mapping               = $DepartmentMap[$Department]
+    $baseSam               = "$($FirstName.Substring(0,1))$LastName".ToLower() -replace '\s', ''
 
-    Write-Log "Creating AD user: $upn in OU: $($mapping.OU)"
+    $existingUser = Get-ADUser -Filter "SamAccountName -eq '$baseSam'" -Properties UserPrincipalName -ErrorAction SilentlyContinue
+
+    if ($existingUser) {
+        $script:ProvisionedUPN = "$($existingUser.UserPrincipalName)"
+        Write-Log "AD user already exists: $($script:ProvisionedUPN) - skipping AD creation." "WARN"
+        return
+    }
+
+    $username = Get-UniqueSamAccountName -FirstName $FirstName -LastName $LastName
+    $script:ProvisionedUPN = "$username@$Domain"
+
+    Write-Log "Creating AD user: $($script:ProvisionedUPN) in OU: $($mapping.OU)"
 
     $securePassword = ConvertTo-SecureString $TempPassword -AsPlainText -Force
 
     New-ADUser `
+        -Name                  $displayName `
         -SamAccountName        $username `
-        -UserPrincipalName     $upn `
+        -UserPrincipalName     $script:ProvisionedUPN `
         -GivenName             $FirstName `
         -Surname               $LastName `
         -DisplayName           $displayName `
@@ -220,12 +240,15 @@ function New-HireADUser {
         -Path                  $mapping.OU
 
     foreach ($group in $mapping.Groups) {
-        Add-ADGroupMember -Identity $group -Members $username
-        Write-Log "Added $username to group: $group"
+        try {
+            Add-ADGroupMember -Identity $group -Members $username
+            Write-Log "Added $username to group: $group"
+        } catch {
+            Write-Log "Could not add $username to group $group - $_" "WARN"
+        }
     }
 
-    Write-Log "AD user created successfully: $upn"
-    return $upn
+    Write-Log "AD user created successfully: $($script:ProvisionedUPN)"
 }
 
 # -------------------------------------------------------
@@ -234,15 +257,19 @@ function New-HireADUser {
 function Invoke-EntraSync {
     Write-Log "Triggering Entra Connect delta sync..."
     Import-Module ADSync -ErrorAction SilentlyContinue
-    Start-ADSyncSyncCycle -PolicyType Delta
+    Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
     Write-Log "Delta sync triggered."
 }
 
 # -------------------------------------------------------
 # Wait for user to appear in Entra ID
+# Polls every 30 seconds for up to 30 minutes
 # -------------------------------------------------------
 function Wait-ForEntraUser {
-    param([string]$UPN, [int]$MaxWaitMinutes = 15)
+    param(
+        [string]$UPN,
+        [int]$MaxWaitMinutes = 30
+    )
 
     $timeout = (Get-Date).AddMinutes($MaxWaitMinutes)
 
@@ -252,7 +279,8 @@ function Wait-ForEntraUser {
             Write-Log "User $UPN confirmed in Entra ID."
             return $user
         }
-        Write-Log "Waiting for Entra sync... ($([math]::Round(($timeout - (Get-Date)).TotalMinutes, 1)) min remaining)"
+        $minutesLeft = [math]::Round(($timeout - (Get-Date)).TotalMinutes, 1)
+        Write-Log "Waiting for Entra sync... ($minutesLeft min remaining)"
         Start-Sleep -Seconds 30
     } while ((Get-Date) -lt $timeout)
 
@@ -261,16 +289,45 @@ function Wait-ForEntraUser {
 
 # -------------------------------------------------------
 # Assign M365 license
+# Skips if license already assigned
 # -------------------------------------------------------
 function Set-UserLicense {
-    param([string]$UPN)
+    param([string]$UPN, [string]$UsageLocation = "US")
 
     Test-LicenseAvailability -SkuId $LicenseSkuId
+
+    $user = Get-MgUser -UserId $UPN -Property "assignedLicenses,usageLocation" -ErrorAction SilentlyContinue
+    if ($user.AssignedLicenses | Where-Object { $_.SkuId -eq $LicenseSkuId }) {
+        Write-Log "License already assigned to $UPN - skipping."
+        return
+    }
+
+    # Usage location is required before any license can be assigned
+    if ([string]::IsNullOrWhiteSpace($user.UsageLocation)) {
+        Write-Log "Setting usage location to '$UsageLocation' for $UPN"
+        Update-MgUser -UserId $UPN -UsageLocation $UsageLocation -ErrorAction Stop | Out-Null
+
+        # Wait for usage location to propagate before assigning license
+        $locationSet = $false
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 5
+            $check = Get-MgUser -UserId $UPN -Property "usageLocation" -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($check.UsageLocation)) {
+                $locationSet = $true
+                Write-Log "Usage location confirmed for $UPN after $(($i + 1) * 5) seconds"
+                break
+            }
+        }
+        if (-not $locationSet) {
+            throw "Usage location did not propagate for $UPN within 60 seconds."
+        }
+    }
 
     Set-MgUserLicense `
         -UserId         $UPN `
         -AddLicenses    @(@{ SkuId = $LicenseSkuId }) `
-        -RemoveLicenses @()
+        -RemoveLicenses @() `
+        -ErrorAction Stop | Out-Null
 
     Write-Log "M365 license assigned to $UPN"
 }
@@ -279,7 +336,15 @@ function Set-UserLicense {
 # Send credentials email to manager
 # -------------------------------------------------------
 function Send-CredentialsEmail {
-    param($ManagerEmail, $FirstName, $LastName, $UPN, $TempPassword, $Department, $StartDate)
+    param(
+        [string]$ManagerEmail,
+        [string]$FirstName,
+        [string]$LastName,
+        [string]$UPN,
+        [string]$TempPassword,
+        [string]$Department,
+        [string]$StartDate
+    )
 
     $subject = "New Hire Account Ready: $FirstName $LastName"
     $body    = @"
@@ -318,22 +383,33 @@ This message was generated automatically by the SlyTech Identity Lifecycle Autom
         }
     }
 
-    Send-MgUserMail -UserId "admin@slytechlab.onmicrosoft.com" -BodyParameter $message
+    Send-MgUserMail -UserId "admin@slytechlab.onmicrosoft.com" -BodyParameter $message | Out-Null
     Write-Log "Credentials email sent to $ManagerEmail for $UPN"
 }
 
 # -------------------------------------------------------
-# Update SharePoint item status
+# Update SharePoint item status via raw Graph API
 # -------------------------------------------------------
 function Update-RequestStatus {
-    param($SiteId, $ListId, $ItemId, $Status, $UPN)
+    param(
+        [string]$SiteId,
+        [string]$ListId,
+        [string]$ItemId,
+        [string]$Status,
+        [string]$UPN = ""
+    )
 
     $fields = @{
         Status         = $Status
         ProvisionedUPN = $UPN
         CompletedDate  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
     }
-    Update-MgSiteListItem -SiteId $SiteId -ListId $ListId -ListItemId $ItemId -Fields $fields
+
+    Invoke-MgGraphRequest -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$SiteId/lists/$ListId/items/$ItemId/fields" `
+        -Body ($fields | ConvertTo-Json) `
+        -ContentType "application/json" | Out-Null
+
     Write-Log "SharePoint item $ItemId updated to status: $Status"
 }
 
@@ -349,10 +425,13 @@ Write-Log "Script started on $env:COMPUTERNAME"
 try {
     Connect-Graph
 
-    $siteId  = (Get-MgSite -SiteId "slytechlab.sharepoint.com:/sites/IT").Id
-    $list    = Get-MgSiteList -SiteId $siteId | Where-Object { $_.DisplayName -eq $ListName }
-    $pending = Get-MgSiteListItem -SiteId $siteId -ListId $list.Id -ExpandProperty Fields |
-               Where-Object { $_.Fields.AdditionalData.Status -eq "Pending" }
+    $siteId = (Get-MgSite -SiteId "slytechlab.sharepoint.com:/sites/IT").Id
+    $list   = Get-MgSiteList -SiteId $siteId | Where-Object { $_.DisplayName -eq $ListName }
+
+    $result  = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$($list.Id)/items?expand=fields"
+    # Force array so .Count reflects record count, not property count on a single object
+    $pending = @($result.value | Where-Object { $_.fields.Status -eq "Pending" })
 
     if ($pending.Count -eq 0) {
         Write-Log "No pending requests found. Exiting."
@@ -363,52 +442,64 @@ try {
     Write-Log "Found $($pending.Count) pending request(s)"
 
     foreach ($item in $pending) {
-        $fields = $item.Fields.AdditionalData
+        $fields = $item.fields
 
-        Write-Log "--- Processing request ID: $($item.Id) ---"
+        Write-Log "--- Processing request ID: $($item.id) ---"
 
         try {
             Test-NewHireRequest -Fields $fields
 
             $tempPassword = New-TempPassword
 
-            $upn = New-HireADUser `
-                -FirstName    $fields.FirstName `
-                -LastName     $fields.LastName `
-                -Department   $fields.Department `
-                -JobTitle     $fields.JobTitle `
+            New-HireADUser `
+                -FirstName    ([string]$fields.FirstName) `
+                -LastName     ([string]$fields.LastName) `
+                -Department   ([string]$fields.Department) `
+                -JobTitle     ([string]$fields.JobTitle) `
                 -TempPassword $tempPassword
 
-            Invoke-EntraSync
+            $upn = $script:ProvisionedUPN
+            Write-Log "Provisioned UPN: $upn"
 
-            Wait-ForEntraUser -UPN $upn
+            if ([string]::IsNullOrWhiteSpace($upn)) {
+                throw "UPN is empty after AD provisioning - cannot continue."
+            }
+
+            # Check if user already exists in Entra before syncing
+            $entraUser = Get-MgUser -UserId $upn -ErrorAction SilentlyContinue
+            if ($entraUser) {
+                Write-Log "User $upn already exists in Entra ID - skipping sync and wait."
+            } else {
+                Invoke-EntraSync
+                Wait-ForEntraUser -UPN $upn
+            }
 
             Set-UserLicense -UPN $upn
 
             Send-CredentialsEmail `
-                -ManagerEmail $fields.ManagerEmail `
-                -FirstName    $fields.FirstName `
-                -LastName     $fields.LastName `
+                -ManagerEmail ([string]$fields.ManagerEmail) `
+                -FirstName    ([string]$fields.FirstName) `
+                -LastName     ([string]$fields.LastName) `
                 -UPN          $upn `
                 -TempPassword $tempPassword `
-                -Department   $fields.Department `
-                -StartDate    $fields.StartDate
+                -Department   ([string]$fields.Department) `
+                -StartDate    ([string]$fields.StartDate)
 
             Update-RequestStatus `
                 -SiteId  $siteId `
                 -ListId  $list.Id `
-                -ItemId  $item.Id `
+                -ItemId  $item.id `
                 -Status  "Completed" `
                 -UPN     $upn
 
             Write-Log "Successfully onboarded: $upn" "SUCCESS"
         }
         catch {
-            Write-Log "Failed to process request $($item.Id): $_" "ERROR"
+            Write-Log "Failed to process request $($item.id): $_" "ERROR"
             Update-RequestStatus `
                 -SiteId  $siteId `
                 -ListId  $list.Id `
-                -ItemId  $item.Id `
+                -ItemId  $item.id `
                 -Status  "Failed" `
                 -UPN     ""
         }
