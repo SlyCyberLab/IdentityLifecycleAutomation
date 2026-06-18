@@ -19,6 +19,7 @@ HR fills Power Apps form
         → Sends email to manager via Graph API
         → Updates SharePoint item (Status: Completed)
 ```
+Handle 8 different tasks without manual intervention
 
 ---
 
