@@ -40,17 +40,7 @@ The goal is to close two gaps that exist in almost every environment: the time s
 
 ## 🏗️ Architecture
 
-```
-HR fills Power Apps form
-  → SharePoint List (Status: Pending)
-    → Task Scheduler on DC01 (every 15 min)
-      → PowerShell script polls SharePoint via Graph API
-        → Creates / disables AD user
-        → Triggers Entra Connect delta sync
-        → Assigns / removes M365 license via Graph API
-        → Sends notification email to manager via Graph API
-        → Updates SharePoint item (Status: Completed)
-```
+![Architecture](./screenshots/00-architecture-diagram.png)
 
 The full onboarding sequence runs eight distinct actions without manual intervention; offboarding runs nine.
 
